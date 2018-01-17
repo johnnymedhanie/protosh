@@ -2,8 +2,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <sys/types.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
+
 
 /*
   Function Declarations for builtin shell commands:
@@ -12,24 +15,40 @@ int protosh_cd(char **args);
 int protosh_help(char **args);
 int protosh_exit(char **args);
 
+
+
+/* Shared global variables */
+static char **history;             /* array of strings for storing history */
+static int history_len;            /* current number of items in history */
+static char *input;		   /* input entered by the user */
+
+/* useful for keeping track of parent's prev call for cleanup */
+static struct command *parent_cmd;
+static struct commands *parent_cmds;
+static char *temp_line;
+
+
 /*
   List of builtin commands, followed by their corresponding functions.
  */
 char *builtin_str[] = {
   "cd",
   "help",
-  "exit"
+  "exit",
+  "history"
 };
 
 int (*builtin_func[]) (char **) = {
   &protosh_cd,
   &protosh_help,
-  &protosh_exit
+  &protosh_exit,
+  &protosh_history
 };
 
 int protosh_num_builtins() {
   return sizeof(builtin_str) / sizeof(char *);
 }
+
 
 /*
   Builtin function implementations.
@@ -236,6 +255,142 @@ void protosh_loop(void)
     free(line);
     free(args);
   } while (status);
+}
+
+
+/* returns whether a command is a history command */
+int is_history_command(char *input)
+{
+	const char *key = "history";
+
+	if (strlen(input) < strlen(key))
+		return 0;
+	int i;
+
+	for (i = 0; i < (int) strlen(key); i++) {
+		if (input[i] != key[i])
+			return 0;
+	}
+	return 1;
+}
+/* Clears the history */
+int clear_history(void)
+{
+	int i;
+
+	for (i = 0; i < history_len; i++)
+		free(history[i]);
+	history_len = 0;
+	return 0;
+}
+
+/* Responsible for handling the history shell builtin */
+int protosh_history(struct commands *cmds, struct command *cmd)
+{
+	/* just `history` executed? print history */
+	if (cmd->argc == 1) {
+		int i;
+
+		for (i = 0; i < history_len ; i++) {
+			// write to a file descriptor - output_fd
+			printf("%d %s\n", i, history[i]);
+		}
+		return 1;
+	}
+	if (cmd->argc > 1) {
+		/* clear history */
+		if (strcmp(cmd->argv[1], "-c") == 0) {
+			clear_history();
+			return 0;
+		}
+
+		/* exec command from history */
+		char *end;
+		long loffset;
+		int offset;
+
+		loffset = strtol(cmd->argv[1], &end, 10);
+		if (end == cmd->argv[1]) {
+			fprintf(stderr, "error: cannot convert to number\n");
+			return 1;
+		}
+
+		offset = (int) loffset;
+		if (offset > history_len) {
+			fprintf(stderr, "error: offset > number of items\n");
+			return 1;
+		}
+
+		/* parse execute command */
+		char *line = strdup(history[offset]);
+
+		if (line == NULL)
+			return 1;
+
+		struct commands *new_commands = parse_commands_with_pipes(line);
+
+		/* set pointers so that these can be freed when
+		 * child processes die during execution
+		 */
+		parent_cmd = cmd;
+		temp_line = line;
+		parent_cmds = cmds;
+
+		exec_commands(new_commands);
+		cleanup_commands(new_commands);
+		free(line);
+
+		/* reset */
+		parent_cmd = NULL;
+		temp_line = NULL;
+		parent_cmds = NULL;
+
+		return 0;
+	}
+	return 0;
+}
+
+/* Adds the user's input to the history. the implementation
+ * is rather simplistic in that it uses memmove whenever
+ * the number of items reaches max number of items.
+ * For a few 100 items, this works well and easy to reason about
+ */
+int add_to_history(char *input)
+{
+	/* initialize on first call */
+	if (history == NULL) {
+		history = calloc(sizeof(char *) * HISTORY_MAXITEMS, 1);
+		if (history == NULL) {
+			fprintf(stderr, "error: memory alloc error\n");
+			return 0;
+		}
+	}
+
+	/* make a copy of the input */
+	char *line;
+
+	line = strdup(input);
+	if (line == NULL)
+		return 0;
+
+	/* when max items have been reached, move the old
+	 * contents to a previous position, and decrement len
+	 */
+	if (history_len == HISTORY_MAXITEMS) {
+		free(history[0]);
+		int space_to_move = sizeof(char *) * (HISTORY_MAXITEMS - 1);
+
+		memmove(history, history+1, space_to_move);
+		if (history == NULL) {
+			fprintf(stderr, "error: memory alloc error\n");
+			return 0;
+		}
+
+		history_len--;
+	}
+
+	history[history_len++] = line;
+	return 1;
 }
 
 /**
